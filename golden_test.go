@@ -2,7 +2,6 @@ package gpgkms
 
 import (
 	"bytes"
-	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"flag"
@@ -44,7 +43,7 @@ func TestGoldenPublicKey(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			e, err := NewEntity(opaqueSigner{key: (*rsa.PrivateKey)(key)}, id)
+			e, err := NewEntity(opaqueSigner{key: key}, id)
 			must(t, err)
 			var got bytes.Buffer
 			must(t, WritePublicKey(&got, e, true))
