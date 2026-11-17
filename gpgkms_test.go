@@ -121,6 +121,7 @@ func TestIdentityValidation(t *testing.T) {
 		"no name":    {Created: time.Unix(1, 0)},
 		"no created": {Name: "x"},
 		"negative":   {Name: "x", Created: time.Unix(1, 0), Lifetime: -time.Hour},
+		"too long":   {Name: "x", Created: time.Unix(1, 0), Lifetime: (1 << 32) * time.Second},
 	} {
 		if _, err := NewEntity(newTestSigner(t), id); err == nil {
 			t.Errorf("%s: want error", name)

@@ -62,3 +62,16 @@ err = gpgkms.Sign(w, entity, file, gpgkms.SignOptions{})
 `compat_test.go` checks that coder/coder's identity derives the same key as the
 original `scripts/gpgkms`, so coder/coder can switch to this module without
 changing its fingerprint.
+
+## Development
+
+```bash
+go test -race ./...
+go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+```
+
+CI runs the tests on Linux and macOS, golangci-lint, govulncheck (also weekly),
+and actionlint plus zizmor on the workflows. Dependabot proposes grouped Go and
+Actions updates weekly, after a 7-day cooldown. `go.mod` pins a patched
+toolchain, so `go install` of the command builds with it.

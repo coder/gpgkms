@@ -74,7 +74,8 @@ func NewEntity(signer crypto.Signer, id Identity) (*openpgp.Entity, error) {
 	err := e.AddUserId(id.Name, id.Comment, id.Email, &packet.Config{
 		DefaultHash:     crypto.SHA256,
 		Time:            func() time.Time { return id.Created },
-		KeyLifetimeSecs: uint32(id.Lifetime / time.Second),
+		KeyLifetimeSecs: uint32(id.Lifetime / time.Second), //nolint:gosec // validate bounds Lifetime to [0, 2^32-1] seconds
+
 		// go-crypto adds a random salt notation to v4 signatures by default,
 		// which would change the exported key every time.
 		NonDeterministicSignaturesViaNotation: &deterministic,
