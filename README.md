@@ -23,11 +23,11 @@ go tool gpgkms sign IDENTITY -out SHA256SUMS.sig -armor=false SHA256SUMS
 
 | Flag | |
 |---|---|
-| `-key` | CryptoKeyVersion, e.g. `projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1`. Algorithm `RSA_SIGN_PKCS1_4096_SHA256`. |
+| `-key` | CryptoKeyVersion, e.g. `projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1`. Algorithm `RSA_SIGN_PKCS1_4096_SHA256`, protection level `HSM` (software and external keys are rejected). |
 | `-name`, `-comment`, `-email` | OpenPGP user ID. |
 | `-created` | Key creation time (RFC 3339). **Part of the fingerprint: never change it.** |
 | `-lifetime` | Validity from `-created` (Go duration, e.g. `35040h`). 0 = never expires. |
-| `-fingerprint` | Fail unless the derived key has this fingerprint. Use it in CI to pin the identity. |
+| `-fingerprint` | Fail unless the derived key has this fingerprint. Use it in CI to pin the key. The fingerprint covers only `-key` and `-created`, not the user ID or `-lifetime`. |
 
 `sign` writes an ASCII-armored signature by default; `-armor=false` writes a
 binary one, which the Terraform Registry requires for `SHA256SUMS.sig`.
