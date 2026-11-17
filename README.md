@@ -2,7 +2,7 @@
 
 OpenPGP (GPG) signatures from an RSA key held in Google Cloud KMS, so a release
 signing key never exists outside the HSM. Extracted from coder/coder's
-`scripts/gpgkms`.
+`scripts/gpgkms`; `compat_test.go` checks that both derive the same key.
 
 The OpenPGP key is derived from the KMS public key, a user ID and a pinned
 creation time. Signing is RSA PKCS#1 v1.5 (deterministic), so the exported
@@ -10,9 +10,13 @@ public key, including its self-signature, is byte-identical every time.
 
 ## CLI
 
+Add it as a tool dependency of your module, then run it with `go tool`:
+
 ```bash
-go run github.com/coder/gpgkms/cmd/gpgkms@<commit> public-key IDENTITY > key.asc
-go run github.com/coder/gpgkms/cmd/gpgkms@<commit> sign IDENTITY -out SHA256SUMS.sig -armor=false SHA256SUMS
+go get -tool github.com/coder/gpgkms/cmd/gpgkms@<commit>
+
+go tool gpgkms public-key IDENTITY > key.asc
+go tool gpgkms sign IDENTITY -out SHA256SUMS.sig -armor=false SHA256SUMS
 ```
 
 `IDENTITY` is the same set of flags for both commands:
@@ -34,7 +38,7 @@ Credentials come from Application Default Credentials, for example
 `google-github-actions/auth` with workload identity federation. The identity
 needs `roles/cloudkms.publicKeyViewer` and `roles/cloudkms.signer` on the key.
 
-## Minting the public key
+### Minting the public key
 
 Publishing the public key needs a self-signature, which needs the signer role.
 Mint it from the same reviewed CI job that signs releases (not locally), commit
@@ -52,26 +56,18 @@ entity, err := gpgkms.NewEntity(signer, gpgkms.Identity{
 err = gpgkms.Sign(w, entity, file, gpgkms.SignOptions{})
 ```
 
-## Users
-
-| Repository | Key | Identity |
-|---|---|---|
-| coder/coder | `coder-release-signing/release-signing/gpg-release` | `Coder Release Signing Key <security@coder.com>`, created `2026-11-16T00:00:00Z`, lifetime `35040h` |
-| coder/terraform-provider-coder | `coder-release-signing/release-signing/gpg-terraform-provider` | see its `release.yml` |
-
-`compat_test.go` checks that coder/coder's identity derives the same key as the
-original `scripts/gpgkms`, so coder/coder can switch to this module without
-changing its fingerprint.
-
 ## Development
 
 ```bash
 go test -race ./...
-go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...
-go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+go tool -modfile=tools/go.mod golangci-lint run ./...
+go tool -modfile=tools/go.mod govulncheck ./...
 ```
 
-CI runs the tests on Linux and macOS, golangci-lint, govulncheck (also weekly),
-and actionlint plus zizmor on the workflows. Dependabot proposes grouped Go and
-Actions updates weekly, after a 7-day cooldown. `go.mod` pins a patched
-toolchain, so `go install` of the command builds with it.
+The dev tools are pinned in `tools/go.mod`, a separate module so their
+dependencies stay out of the library's `go.mod`. CI also lints the workflows
+with actionlint and zizmor.
+
+## License
+
+[MIT](LICENSE)
