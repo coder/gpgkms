@@ -15,8 +15,10 @@
 // <version> is a CryptoKeyVersion resource name with the algorithm
 // RSA_SIGN_PKCS1_4096_SHA256. -created is part of the fingerprint and must
 // never change for a key. -fingerprint makes the command fail unless the
-// derived key has exactly that fingerprint, which pins the identity in CI.
-// Credentials come from Application Default Credentials.
+// derived key has exactly that fingerprint. The fingerprint covers only the KMS
+// public key and -created, not -name, -comment, -email or -lifetime, so it pins
+// the key, not the whole published identity. Credentials come from
+// Application Default Credentials.
 package main
 
 import (
@@ -29,7 +31,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -38,7 +43,11 @@ import (
 )
 
 func main() {
-	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
+	// Cancel in-flight KMS requests when the CI job is cancelled.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	err := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	stop()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "gpgkms:", err)
 		os.Exit(1)
 	}
@@ -88,7 +97,7 @@ func (f *identityFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.email, "email", "", "OpenPGP user ID email")
 	fs.StringVar(&f.created, "created", "", "OpenPGP key creation time, RFC 3339 (part of the fingerprint: never change it)")
 	fs.DurationVar(&f.lifetime, "lifetime", 0, "key validity from -created (0 = never expires)")
-	fs.StringVar(&f.fingerprint, "fingerprint", "", "fail unless the derived key has this fingerprint (hex)")
+	fs.StringVar(&f.fingerprint, "fingerprint", "", "fail unless the derived key has this fingerprint (hex; covers -key and -created, not the user ID or -lifetime)")
 }
 
 func (f *identityFlags) entity(ctx context.Context, stderr io.Writer) (*openpgp.Entity, error) {
@@ -179,14 +188,63 @@ func runSign(ctx context.Context, args []string, stderr io.Writer) error {
 		return fmt.Errorf("open file to sign: %w", err)
 	}
 	defer message.Close()
+	if err := checkNotSameFile(message, *outPath); err != nil {
+		return err
+	}
 
 	var out bytes.Buffer
 	if err := gpgkms.Sign(&out, e, message, gpgkms.SignOptions{Prepend: prepend, Armored: *armored}); err != nil {
 		return err
 	}
-	// #nosec G306 -- detached signatures are public.
-	if err := os.WriteFile(*outPath, out.Bytes(), 0o644); err != nil {
+	if err := writeFileAtomic(*outPath, out.Bytes()); err != nil {
 		return fmt.Errorf("write signature: %w", err)
 	}
 	return nil
+}
+
+// checkNotSameFile refuses an -out that is the file being signed, which would
+// replace the release artifact with its own signature.
+func checkNotSameFile(message *os.File, outPath string) error {
+	outInfo, err := os.Stat(outPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat -out: %w", err)
+	}
+	msgInfo, err := message.Stat()
+	if err != nil {
+		return fmt.Errorf("stat file to sign: %w", err)
+	}
+	if os.SameFile(msgInfo, outInfo) {
+		return fmt.Errorf("-out %s is the file to sign", outPath)
+	}
+	return nil
+}
+
+// writeFileAtomic writes data to a temporary file next to path and renames it
+// over path. Readers never see a partial signature, and an existing symlink at
+// path is replaced instead of followed.
+func writeFileAtomic(path string, data []byte) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	// #nosec G302 -- detached signatures are public; CreateTemp makes the file 0600.
+	if err = tmp.Chmod(0o644); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }

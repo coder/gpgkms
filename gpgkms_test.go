@@ -3,6 +3,8 @@ package gpgkms
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
@@ -122,8 +124,90 @@ func TestIdentityValidation(t *testing.T) {
 		"no created": {Name: "x"},
 		"negative":   {Name: "x", Created: time.Unix(1, 0), Lifetime: -time.Hour},
 		"too long":   {Name: "x", Created: time.Unix(1, 0), Lifetime: (1 << 32) * time.Second},
+		// Truncating to whole seconds would make these "never expires".
+		"sub-second": {Name: "x", Created: time.Unix(1, 0), Lifetime: 500 * time.Millisecond},
+		"fraction":   {Name: "x", Created: time.Unix(1, 0), Lifetime: 1500 * time.Millisecond},
+		// OpenPGP stores the creation time as uint32 seconds, which would wrap.
+		"before 1970": {Name: "x", Created: time.Date(1969, 12, 31, 23, 59, 59, 0, time.UTC)},
+		"after 2106":  {Name: "x", Created: time.Date(2107, 1, 1, 0, 0, 0, 0, time.UTC)},
 	} {
 		if _, err := NewEntity(newTestSigner(t), id); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+
+	// The extremes of the valid ranges still work.
+	for name, id := range map[string]Identity{
+		"max lifetime": {Name: "x", Created: time.Unix(1, 0), Lifetime: (1<<32 - 1) * time.Second},
+		"max created":  {Name: "x", Created: time.Unix(1<<32-1, 0)},
+	} {
+		e, err := NewEntity(newTestSigner(t), id)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if !e.PrimaryKey.CreationTime.Equal(id.Created) {
+			t.Errorf("%s: creation time %v, want %v", name, e.PrimaryKey.CreationTime, id.Created)
+		}
+	}
+}
+
+func TestNewEntityRejectsNonRSA(t *testing.T) {
+	t.Parallel()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	must(t, err)
+	if _, err := NewEntity(key, testIdentity); err == nil || !strings.Contains(err.Error(), "want RSA") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// detachSign returns a binary detached signature over message made by e.
+func detachSign(t *testing.T, e *openpgp.Entity, message string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	must(t, openpgp.DetachSign(&buf, e, strings.NewReader(message), nil))
+	return buf.Bytes()
+}
+
+func TestValidateSignatures(t *testing.T) {
+	t.Parallel()
+	e, err := NewEntity(newTestSigner(t), testIdentity)
+	must(t, err)
+	sig := detachSign(t, e, "x")
+
+	var textSig bytes.Buffer
+	must(t, openpgp.DetachSignText(&textSig, e, strings.NewReader("x"), nil))
+	var certSig bytes.Buffer
+	must(t, e.Identities[testUserID].SelfSignature.Serialize(&certSig))
+	var pubKey bytes.Buffer
+	must(t, e.PrimaryKey.Serialize(&pubKey))
+	// New-format packet headers: 0xC0 | tag, then a one-octet length.
+	unknownPacket := []byte{0xC0 | 60, 4, 'j', 'u', 'n', 'k'}
+	markerPacket := []byte{0xC0 | 10, 3, 'P', 'G', 'P'}
+
+	for name, b := range map[string][]byte{
+		"one": sig,
+		"two": append(append([]byte{}, sig...), sig...),
+	} {
+		if err := ValidateSignatures(b); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	for name, b := range map[string][]byte{
+		"empty":    nil,
+		"truncate": sig[:len(sig)-1],
+		// packet.Reader.Next silently skips these, and gpg rejects the output.
+		"unknown packet after": append(append([]byte{}, sig...), unknownPacket...),
+		"marker packet before": append(append([]byte{}, markerPacket...), sig...),
+		"public key packet":    pubKey.Bytes(),
+		// gpg checks only the first signature when text and binary ones are
+		// mixed, so the KMS signature would go unchecked.
+		"text signature": textSig.Bytes(),
+		// gpg reports a BAD signature, failing the whole file.
+		"certification signature": certSig.Bytes(),
+	} {
+		if err := ValidateSignatures(b); err == nil {
 			t.Errorf("%s: want error", name)
 		}
 	}

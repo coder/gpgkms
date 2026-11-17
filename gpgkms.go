@@ -44,8 +44,15 @@ func (id Identity) validate() error {
 	if id.Created.IsZero() {
 		return errors.New("identity creation time is required (it is part of the fingerprint)")
 	}
-	if id.Lifetime < 0 || id.Lifetime/time.Second > 1<<32-1 {
-		return fmt.Errorf("invalid key lifetime %s", id.Lifetime)
+	// OpenPGP v4 stores the creation time as unsigned 32-bit seconds since the
+	// epoch; go-crypto truncates out-of-range times without an error.
+	if created := id.Created.Unix(); created < 0 || created > 1<<32-1 {
+		return fmt.Errorf("identity creation time %s is outside the OpenPGP range (1970 to 2106)", id.Created)
+	}
+	// The lifetime is stored in whole seconds, and 0 means "never expires", so a
+	// fraction (500ms) would silently become a key that never expires.
+	if id.Lifetime < 0 || id.Lifetime%time.Second != 0 || id.Lifetime/time.Second > 1<<32-1 {
+		return fmt.Errorf("invalid key lifetime %s: want whole seconds in [0, 2^32-1]", id.Lifetime)
 	}
 	return nil
 }
@@ -164,20 +171,27 @@ func Sign(w io.Writer, e *openpgp.Entity, message io.Reader, opts SignOptions) e
 }
 
 // ValidateSignatures checks that b is a binary stream of one or more OpenPGP
-// signature packets and nothing else.
+// binary-document signature packets (type 0x00, what `gpg --detach-sign`
+// makes) and nothing else. It does not check which data they sign. Other
+// packets or signature types make gpg fail the file, or check only the first
+// signature, so the new signature appended by Sign would be ignored.
 func ValidateSignatures(b []byte) error {
-	reader := packet.NewReader(bytes.NewReader(b))
+	// packet.Read, not packet.Reader.Next: Next silently skips unknown,
+	// unsupported and marker packets, which would then be copied into the
+	// output and make gpg reject the whole signature file.
+	r := bytes.NewReader(b)
 	count := 0
-	for {
-		p, err := reader.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
+	for r.Len() > 0 {
+		p, err := packet.Read(r)
 		if err != nil {
-			return fmt.Errorf("parse packet (the signature must be binary, not armored): %w", err)
+			return fmt.Errorf("parse packet %d (the signature must be binary, not armored): %w", count+1, err)
 		}
-		if _, ok := p.(*packet.Signature); !ok {
+		sig, ok := p.(*packet.Signature)
+		if !ok {
 			return fmt.Errorf("unexpected %T packet, want only signatures", p)
+		}
+		if sig.SigType != packet.SigTypeBinary {
+			return fmt.Errorf("signature %d has type %#x, want a binary document signature (0x00)", count+1, uint8(sig.SigType))
 		}
 		count++
 	}
