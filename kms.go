@@ -151,16 +151,29 @@ func retryKMS[T any](ctx context.Context, delay time.Duration, do func(context.C
 		if err == nil {
 			return v, nil
 		}
-		if attempt == kmsAttempts || !retryable(err) || ctx.Err() != nil {
+		if ctx.Err() != nil {
+			return v, canceledError(ctx, err)
+		}
+		if attempt == kmsAttempts || !retryable(err) {
 			return v, attemptsError(attempt, err)
 		}
 		select {
 		case <-ctx.Done():
-			return v, attemptsError(attempt, err)
+			return v, canceledError(ctx, err)
 		case <-time.After(delay):
 		}
 		delay *= 2
 	}
+}
+
+// canceledError wraps both the context error, so callers can detect
+// cancellation with errors.Is, and the last KMS error, so logs show why the
+// attempts failed.
+func canceledError(ctx context.Context, err error) error {
+	if errors.Is(err, ctx.Err()) {
+		return err
+	}
+	return fmt.Errorf("%w (last error: %w)", ctx.Err(), err)
 }
 
 // attemptsError adds the number of attempts to err when there was more than

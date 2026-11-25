@@ -300,11 +300,31 @@ func TestKMSSignerStopsRetryingWhenContextEnds(t *testing.T) {
 	f.fail(http.StatusServiceUnavailable)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := f.signer(ctx, t); err == nil {
-		t.Fatal("want error")
+	if _, err := f.signer(ctx, t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if n := f.requestCount(); n > 1 {
 		t.Errorf("%d requests after the context ended, want at most 1", n)
+	}
+}
+
+func TestRetryKMSReturnsContextErrorDuringBackoff(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transient := errors.New("credentials: status code 503")
+	calls := 0
+	_, err := retryKMS(ctx, time.Hour, func(context.Context) (struct{}, error) {
+		calls++
+		// End the context while retryKMS waits before the next attempt.
+		time.AfterFunc(10*time.Millisecond, cancel)
+		return struct{}{}, transient
+	})
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, transient) {
+		t.Fatalf("err = %v, want both context.Canceled and the last KMS error", err)
+	}
+	if calls != 1 {
+		t.Errorf("%d calls, want 1", calls)
 	}
 }
 
