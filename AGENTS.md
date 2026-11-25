@@ -47,7 +47,7 @@ module by commit.
 | Path | Purpose |
 |---|---|
 | `gpgkms.go` | `Identity`, `NewEntity` (key derivation and self-signature), `WritePublicKey`, `Sign`, `SignOptions`, `ValidateSignatures`. |
-| `kms.go` | `KMSSigner`, a `crypto.Signer` backed by a Cloud KMS CryptoKeyVersion. Checks the KMS algorithm and HSM protection level, only makes PKCS#1 v1.5 signatures of SHA-256 digests, bounds each request with a timeout, and verifies every KMS signature locally before returning it. |
+| `kms.go` | `KMSSigner`, a `crypto.Signer` backed by a Cloud KMS CryptoKeyVersion. Checks the KMS algorithm and HSM protection level, only makes PKCS#1 v1.5 signatures of SHA-256 digests, bounds each request with a timeout, retries transient failures with backoff (`retryKMS`), and verifies every KMS signature locally before returning it. |
 | `kms_test.go` | Tests `KMSSigner` against a fake Cloud KMS (`httptest` server, `option.WithEndpoint`). Use it for any KMS change; there is no other way to exercise `kms.go` without credentials. |
 | `cmd/gpgkms/main.go` | CLI: flag parsing, `-fingerprint` pinning, file I/O. `newSigner` is a package variable swapped in tests. |
 | `gpgkms_test.go` | Library tests; `opaqueSigner` hides `*rsa.PrivateKey` so tests use the `crypto.Signer` path like KMS does. |

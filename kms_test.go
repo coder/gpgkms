@@ -14,14 +14,19 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"google.golang.org/api/cloudkms/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -33,6 +38,28 @@ type fakeKMS struct {
 	publicKey cloudkms.PublicKey
 	// sign makes the signature returned by asymmetricSign.
 	sign func(r *http.Request, digest []byte) []byte
+
+	mu sync.Mutex
+	// failures are HTTP status codes returned, in order, instead of serving
+	// the next requests.
+	failures []int
+	requests int
+}
+
+// fail makes the next requests fail with the given status codes.
+func (f *fakeKMS) fail(codes ...int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failures = append(f.failures, codes...)
+}
+
+// requestCount returns the number of requests served so far, and resets it.
+func (f *fakeKMS) requestCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.requests
+	f.requests = 0
+	return n
 }
 
 func newFakeKMS(t *testing.T) *fakeKMS {
@@ -61,6 +88,17 @@ func newFakeKMS(t *testing.T) *fakeKMS {
 func (f *fakeKMS) signer(ctx context.Context, t *testing.T) (*KMSSigner, error) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.requests++
+		code := 0
+		if len(f.failures) > 0 {
+			code, f.failures = f.failures[0], f.failures[1:]
+		}
+		f.mu.Unlock()
+		if code != 0 {
+			http.Error(w, http.StatusText(code), code)
+			return
+		}
 		var resp any
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/"+testKeyVersion+"/publicKey":
@@ -84,7 +122,7 @@ func (f *fakeKMS) signer(ctx context.Context, t *testing.T) (*KMSSigner, error) 
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	t.Cleanup(srv.Close)
-	return NewKMSSigner(ctx, testKeyVersion, option.WithEndpoint(srv.URL+"/"), option.WithHTTPClient(srv.Client()))
+	return newKMSSigner(ctx, testKeyVersion, time.Millisecond, option.WithEndpoint(srv.URL+"/"), option.WithHTTPClient(srv.Client()))
 }
 
 func TestKMSSignerSignsVerifiableSignatures(t *testing.T) {
@@ -199,5 +237,117 @@ func TestKMSSignerStopsWhenContextEnds(t *testing.T) {
 		}
 	case <-time.After(time.Minute):
 		t.Fatal("Sign did not return after its context ended")
+	}
+}
+
+func TestKMSSignerRetriesTransientErrors(t *testing.T) {
+	t.Parallel()
+	f := newFakeKMS(t)
+	f.fail(http.StatusServiceUnavailable, http.StatusTooManyRequests)
+	signer, err := f.signer(context.Background(), t)
+	must(t, err)
+	if n := f.requestCount(); n != 3 {
+		t.Errorf("get public key: %d requests, want 3", n)
+	}
+
+	f.fail(http.StatusInternalServerError, http.StatusBadGateway, http.StatusGatewayTimeout, http.StatusRequestTimeout)
+	digest := sha256.Sum256([]byte("x"))
+	if _, err := signer.Sign(rand.Reader, digest[:], crypto.SHA256); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if n := f.requestCount(); n != kmsAttempts {
+		t.Errorf("sign: %d requests, want %d", n, kmsAttempts)
+	}
+}
+
+func TestKMSSignerGivesUpAfterAttempts(t *testing.T) {
+	t.Parallel()
+	f := newFakeKMS(t)
+	signer, err := f.signer(context.Background(), t)
+	must(t, err)
+	f.requestCount()
+
+	for range kmsAttempts + 1 {
+		f.fail(http.StatusServiceUnavailable)
+	}
+	digest := sha256.Sum256([]byte("x"))
+	_, err = signer.Sign(rand.Reader, digest[:], crypto.SHA256)
+	if err == nil || !strings.Contains(err.Error(), "failed 5 attempts") {
+		t.Fatalf("err = %v", err)
+	}
+	if n := f.requestCount(); n != kmsAttempts {
+		t.Errorf("%d requests, want %d", n, kmsAttempts)
+	}
+}
+
+func TestKMSSignerDoesNotRetryPermanentErrors(t *testing.T) {
+	t.Parallel()
+	for _, code := range []int{http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound} {
+		f := newFakeKMS(t)
+		f.fail(code)
+		if _, err := f.signer(context.Background(), t); err == nil || strings.Contains(err.Error(), "attempts") {
+			t.Errorf("%d: err = %v, want error without retries", code, err)
+		}
+		if n := f.requestCount(); n != 1 {
+			t.Errorf("%d: %d requests, want 1", code, n)
+		}
+	}
+}
+
+func TestKMSSignerStopsRetryingWhenContextEnds(t *testing.T) {
+	t.Parallel()
+	f := newFakeKMS(t)
+	f.fail(http.StatusServiceUnavailable)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.signer(ctx, t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n := f.requestCount(); n > 1 {
+		t.Errorf("%d requests after the context ended, want at most 1", n)
+	}
+}
+
+func TestRetryKMSReturnsContextErrorDuringBackoff(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transient := errors.New("credentials: status code 503")
+	calls := 0
+	_, err := retryKMS(ctx, time.Hour, func(context.Context) (struct{}, error) {
+		calls++
+		// End the context while retryKMS waits before the next attempt.
+		time.AfterFunc(10*time.Millisecond, cancel)
+		return struct{}{}, transient
+	})
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, transient) {
+		t.Fatalf("err = %v, want both context.Canceled and the last KMS error", err)
+	}
+	if calls != 1 {
+		t.Errorf("%d calls, want 1", calls)
+	}
+}
+
+func TestRetryable(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"credentials 503": {errors.New(`Get "https://cloudkms.googleapis.com/v1/k/publicKey": credentials: status code 503: upstream connect error`), true},
+		"network error":   {&url.Error{Op: "Post", URL: "https://cloudkms.googleapis.com", Err: errors.New("connection reset by peer")}, true},
+		"deadline":        {context.DeadlineExceeded, true},
+		"KMS 500":         {&googleapi.Error{Code: http.StatusInternalServerError}, true},
+		"KMS 503":         {fmt.Errorf("wrapped: %w", &googleapi.Error{Code: http.StatusServiceUnavailable}), true},
+		"KMS 408":         {&googleapi.Error{Code: http.StatusRequestTimeout}, true},
+		"KMS 429":         {&googleapi.Error{Code: http.StatusTooManyRequests}, true},
+		"KMS 400":         {&googleapi.Error{Code: http.StatusBadRequest}, false},
+		"KMS 401":         {&googleapi.Error{Code: http.StatusUnauthorized}, false},
+		"KMS 403":         {&googleapi.Error{Code: http.StatusForbidden}, false},
+		"KMS 404":         {&googleapi.Error{Code: http.StatusNotFound}, false},
+	} {
+		if got := retryable(tc.err); got != tc.want {
+			t.Errorf("%s: retryable = %v, want %v", name, got, tc.want)
+		}
 	}
 }

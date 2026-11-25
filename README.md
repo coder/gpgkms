@@ -37,6 +37,9 @@ binary one, which the Terraform Registry requires for `SHA256SUMS.sig`.
 Credentials come from Application Default Credentials, for example
 `google-github-actions/auth` with workload identity federation. The identity
 needs `roles/cloudkms.publicKeyViewer` and `roles/cloudkms.signer` on the key.
+KMS requests that fail transiently (5xx, 408, 429, network or credential
+errors) are retried up to 5 times with exponential backoff; other 4xx errors
+fail immediately.
 
 ### Minting the public key
 
